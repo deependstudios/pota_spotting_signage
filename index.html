@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="author" content="Jim Davis - N8JRD">
+<!--
+  POTA Spotter - Parks on the Air live spots sign display
+  Version: 1.1.0
+  Author:  Jim Davis - N8JRD (vibe coded with Claude) 2026
+
+  DESCRIPTION
+    Single-page 1080x1920 sign display showing live Parks on the Air (POTA)
+    activator spots for one US state (default: Michigan) on an Esri dark map,
+    with a table of all callsigns below.
+
+  DATA SOURCES
+    Spots:       https://api.pota.app/spot/activator  (polled every 3 minutes)
+    Map tiles:   Esri World Dark Gray Base + Reference, via Leaflet 1.9.4
+    Geolocation: browser location + OpenStreetMap Nominatim reverse lookup
+
+  HOW IT WORKS
+    - A spot is "On Air" while it appears in the latest POTA response. When it
+      drops out of the feed it becomes "QRT" and is kept for 20 minutes.
+    - Spots are tracked per callsign and park reference (e.g. N8JRD|US-1234).
+    - Map: tree icon with callsign, park name and US-xxxx reference. On Air
+      trees are green and pulse; QRT trees are gray.
+    - A QRT spot that would overlap an On Air spot is removed from the map
+      (it stays in the list until its 20 minutes are up).
+    - Overlapping spots, or several callsigns at one park, are collapsed into a
+      small table joined to the trees by lines. When several parks share a
+      table, each park gets its own color on its tree, line and table rows.
+    - "Change Location" selects another state from a list or uses the browser
+      location, and filters by operating mode (CW, DATA = DATA/FT4/FT8,
+      PHONE = PHONE/SSB). All three modes are shown by default. Modes outside
+      these groups (e.g. FM) are always shown. Choices are saved in the browser
+      (localStorage).
+
+  CONFIGURATION (top of the script)
+    POLL_MS       Spot refresh interval
+    INACTIVE_MS   How long QRT spots are kept
+    MAX_ROWS      Rows shown in the list
+    MODE_GROUPS   Operating mode filter groups
+    STATES        State names and map bounds
+    CLUSTER_COLORS  Colors used for parks that share a table
+
+  DEPLOYMENT NOTES
+    - Serve over http(s); browser location requires HTTPS or localhost.
+    - Requires internet access to api.pota.app, Esri, Nominatim and cdnjs.
+
+  RELEASE NOTES
+    1.1.0 (2026)
+      - Operating mode filter (CW / DATA / PHONE) in the Change Location tool,
+        applied to both the map and the list.
+
+    1.0.0 (2026)
+      - Initial release: live Michigan POTA spots on a Leaflet / Esri dark map.
+      - Change Location tool: state dropdown or browser location.
+      - On Air / QRT status with 20 minute QRT retention.
+      - Overlap handling: QRT spots yield to On Air spots; crowded spots and
+        multi-callsign parks are grouped into tables with leader lines.
+      - Per-park colors for parks sharing a table.
+      - Compass rose header icon; layout and palette based on the ADS-B radar page.
+-->
+
+<title>POTA Spotter</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@300;400;500;600;700&family=Source+Sans+Pro:wght@300;400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<style>
+  :root{
+    --amber:#ff7030; --amber-bright:#ffab73; --cream:#fdf8e5;
+    --line:rgba(253,248,229,0.12); --line-soft:rgba(253,248,229,0.07); --panel:rgba(255,255,255,0.03);
+    --green:#5fd48a; --red:#e2685b; --grey:#7d8996;
+  }
+  *{ box-sizing:border-box; margin:0; padding:0; }
+  body {
+    width: 1080px;
+    height: 1920px;
+    background: linear-gradient(180deg, #0d1620 0%, #152333 55%, #1e3347 100%);
+    font-family: 'Source Sans Pro', 'Segoe UI', sans-serif;
+    color: #fdf8e5;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    position: relative;
+  }
+
+  /* HEADER */
+  #header{ flex:0 0 118px; display:flex; align-items:center; justify-content:space-between; padding:0 44px; border-bottom:1px solid var(--line); }
+  #title-block{ display:flex; align-items:center; gap:18px; }
+  #compass-mark{ width:52px; height:52px; flex:0 0 auto; }
+  #title-text h1{ font-family:'Oswald',sans-serif; font-weight:600; font-size:40px; letter-spacing:0.06em; text-transform:uppercase; color:var(--cream); line-height:1; }
+  #title-text .sub{ margin-top:6px; font-family:'Oswald',sans-serif; font-size:13px; letter-spacing:0.28em; text-transform:uppercase; color:var(--amber); opacity:0.85; }
+  #status-block{ display:flex; flex-direction:column; align-items:flex-end; gap:6px; }
+  #status{ display:flex; align-items:center; gap:10px; font-family:'Oswald',sans-serif; font-size:15px; letter-spacing:0.15em; text-transform:uppercase; color:var(--cream); opacity:0.9; }
+  #status .dot{ width:10px; height:10px; border-radius:50%; background:var(--green); box-shadow:0 0 8px var(--green); animation:pulse 1.8s ease-in-out infinite; }
+  #status.unreachable .dot{ background:var(--red); box-shadow:0 0 8px var(--red); animation:none; }
+  @keyframes pulse{ 0%,100%{ opacity:1; transform:scale(1); } 50%{ opacity:0.45; transform:scale(0.8); } }
+  #last-updated{ font-size:13px; color:rgba(253,248,229,0.5); }
+
+  /* LEGEND BAR */
+  #legend{ flex:0 0 84px; display:flex; align-items:center; justify-content:space-between; padding:0 44px; border-bottom:1px solid var(--line); background:var(--panel); }
+  .legend-items{ display:flex; gap:32px; font-family:'Oswald',sans-serif; font-size:24px; letter-spacing:0.02em; color:var(--cream); }
+  .legend-items span{ display:flex; align-items:center; gap:10px; }
+  .legend-items i{ width:14px; height:14px; border-radius:50%; display:inline-block; }
+  .legend-items .a i{ background:var(--green); box-shadow:0 0 8px var(--green); }
+  .legend-items .i i{ background:var(--grey); }
+  #edit-loc-btn{ font-family:'Oswald',sans-serif; font-size:13px; letter-spacing:0.16em; text-transform:uppercase; color:#0d1620; background:var(--amber); border:none; border-radius:4px; padding:12px 22px; cursor:pointer; }
+  #edit-loc-btn:hover{ background:var(--amber-bright); }
+
+  /* MAP */
+  #map-wrap{ flex:0 0 942px; position:relative; padding:22px; border-bottom:1px solid var(--line); }
+  #map-frame{ position:relative; width:100%; height:100%; border-radius:16px; overflow:hidden; border:1px solid rgba(253,248,229,0.16); box-shadow:0 10px 28px rgba(0,0,0,0.4); }
+  #map{ width:100%; height:100%; background:#0f1a26; }
+  .leaflet-tile-pane{ filter:brightness(0.85) sepia(0.1) hue-rotate(-8deg); }
+  #map-frame::after{ content:''; position:absolute; inset:0; z-index:300; pointer-events:none; background:linear-gradient(180deg, rgba(13,22,32,0.35) 0%, rgba(21,35,51,0.12) 40%, rgba(30,51,71,0.35) 100%); }
+  #map-caption{ position:absolute; left:20px; bottom:16px; z-index:800; font-family:'Oswald',sans-serif; font-size:12px; letter-spacing:0.14em; text-transform:uppercase; color:rgba(253,248,229,0.55); }
+  #attribution{ position:absolute; right:16px; bottom:14px; z-index:800; font-size:12px; color:rgba(253,248,229,0.45); }
+  #attribution a{ color:rgba(253,248,229,0.6); }
+
+  /* MAP PINS */
+  .pin{ position:absolute; left:0; top:0; width:0; height:0; }
+  .pin svg{ position:absolute; left:-16px; top:-40px; width:32px; height:40px; overflow:visible; }
+  .pin svg path{ stroke:#0d1620; stroke-width:1.5; }
+  .pin.active svg path{ fill:var(--green); }
+  .pin.inactive svg{ opacity:.7; }
+  .pin.inactive svg path{ fill:var(--grey); }
+  .pin .ring{ position:absolute; left:-16px; top:-32px; width:32px; height:32px; border:3px solid var(--green); border-radius:50%; animation:ring 2s ease-out infinite; }
+  @keyframes ring{ from{ opacity:.9; transform:scale(.6); } to{ opacity:0; transform:scale(2.2); } }
+  .pin.tinted svg path, .pin.tinted.inactive svg path{ fill:var(--c); }
+  .pin.tinted .ring{ border-color:var(--c); }
+  .pin.tinted.inactive svg{ opacity:.5; filter:grayscale(.6); }
+  .pin-label{ position:absolute; left:22px; top:-40px; white-space:nowrap; text-shadow:0 0 4px #0d1620, 0 0 4px #0d1620, 0 0 6px #0d1620; }
+  .pin.left .pin-label{ left:auto; right:22px; text-align:right; }
+  .pin-label .call{ font-family:'Oswald',sans-serif; font-weight:600; font-size:20px; letter-spacing:0.03em; }
+  .pin-label .pk{ font-size:14px; line-height:1.15; }
+  .pin.active .call{ color:var(--amber-bright); } .pin.active .pk{ color:var(--cream); }
+  .pin.inactive .call, .pin.inactive .pk{ color:#8d99a5; }
+
+  /* CLUSTER TABLES */
+  .cluster{ position:absolute; left:0; top:0; width:380px; padding:5px 8px; background:rgba(13,22,32,0.92); border:1px solid rgba(253,248,229,0.3); border-radius:6px; box-shadow:0 4px 14px rgba(0,0,0,0.5); }
+  .cluster .crow{ display:grid; grid-template-columns:12px 96px 1fr 72px; gap:8px; align-items:center; height:24px; }
+  .cluster .cdot{ width:10px; height:10px; border-radius:50%; background:var(--green); box-shadow:0 0 6px var(--green); }
+  .cluster .ccall{ font-family:'Oswald',sans-serif; font-weight:600; font-size:16px; letter-spacing:0.03em; color:var(--amber-bright); }
+  .cluster .cpark{ font-size:13px; color:var(--cream); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .cluster .cref{ font-family:'Oswald',sans-serif; font-size:14px; color:var(--amber); text-align:right; }
+  .cluster .crow.inactive .cdot{ background:var(--grey); box-shadow:none; }
+  .cluster .crow.tinted .cdot{ background:var(--c); box-shadow:0 0 6px var(--c); }
+  .cluster .crow.tinted.active .ccall{ color:var(--c); }
+  .cluster .crow.tinted.inactive .cdot{ opacity:.4; box-shadow:none; }
+  .cluster .crow.inactive .ccall, .cluster .crow.inactive .cpark, .cluster .crow.inactive .cref{ color:#8d99a5; }
+
+  /* LIST */
+  #list-header{ flex:0 0 74px; display:flex; align-items:center; justify-content:space-between; padding:0 44px; }
+  #list-title-block{ display:flex; align-items:baseline; gap:12px; }
+  #list-header h2{ font-family:'Oswald',sans-serif; font-weight:600; font-size:23px; letter-spacing:0.2em; text-transform:uppercase; color:var(--amber); }
+  #list-subtitle{ font-size:14px; letter-spacing:0.03em; color:rgba(253,248,229,0.5); }
+  #ac-count{ font-family:'Oswald',sans-serif; font-size:23px; letter-spacing:0.1em; color:var(--amber); }
+  #ac-count b{ font-weight:600; }
+  #cols{ flex:0 0 40px; display:flex; align-items:center; padding:0 44px; font-family:'Oswald',sans-serif; font-size:12px; letter-spacing:0.14em; text-transform:uppercase; color:rgba(253,248,229,0.45); border-bottom:1px solid var(--line-soft); }
+  #list-wrap{ flex:1 1 auto; overflow:hidden; padding:0 44px 20px; }
+  .col-callsign{ width:220px; flex:0 0 auto; }
+  .col-park{ flex:1 1 auto; min-width:0; }
+  .col-ref{ width:130px; flex:0 0 auto; }
+  .col-freq{ width:120px; flex:0 0 auto; }
+  .col-mode{ width:80px; flex:0 0 auto; }
+  .col-status{ width:130px; flex:0 0 auto; }
+  .row{ display:flex; align-items:center; height:66px; border-bottom:1px solid var(--line-soft); }
+  .row:nth-child(even){ background:rgba(192,192,192,0.08); }
+  .row .col-callsign{ font-family:'Oswald',sans-serif; font-size:28px; font-weight:700; letter-spacing:0.02em; color:var(--cream); padding-left:6px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .row .col-park{ font-size:22px; color:rgba(253,248,229,0.8); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; padding-right:12px; }
+  .row .col-ref{ font-family:'Oswald',sans-serif; font-size:24px; font-weight:600; color:var(--amber); font-variant-numeric:tabular-nums; }
+  .row .col-freq, .row .col-mode{ font-size:22px; color:rgba(253,248,229,0.85); font-variant-numeric:tabular-nums; }
+  .row .col-status{ font-size:20px; display:flex; align-items:center; gap:8px; }
+  .sdot{ width:10px; height:10px; border-radius:50%; background:var(--green); box-shadow:0 0 8px var(--green); }
+  .row.active .col-status{ color:var(--green); }
+  .row.inactive > div{ color:var(--grey); }
+  .row.inactive .col-ref{ color:rgba(255,112,48,0.45); }
+  .row.inactive .sdot{ background:var(--grey); box-shadow:none; }
+  #more{ margin-top:8px; font-family:'Oswald',sans-serif; font-size:16px; letter-spacing:0.14em; text-transform:uppercase; color:rgba(253,248,229,0.5); }
+  #empty{ display:none; padding-top:20px; font-family:'Oswald',sans-serif; font-size:16px; letter-spacing:0.14em; text-transform:uppercase; color:rgba(253,248,229,0.45); }
+
+  /* CHANGE LOCATION OVERLAY */
+  #overlay{ position:absolute; inset:0; background:rgba(8,13,19,0.82); display:none; align-items:center; justify-content:center; z-index:2000; }
+  #overlay.show{ display:flex; }
+  #edit-panel{ width:640px; background:linear-gradient(180deg,#16273a 0%,#1c3049 100%); border:1px solid var(--line); border-radius:10px; padding:36px 40px; }
+  #edit-panel h3{ font-family:'Oswald',sans-serif; font-size:22px; letter-spacing:0.12em; text-transform:uppercase; margin-bottom:22px; color:var(--cream); }
+  #edit-panel label{ display:block; font-family:'Oswald',sans-serif; font-size:12px; letter-spacing:0.14em; text-transform:uppercase; color:var(--amber); margin-bottom:6px; }
+  #edit-panel select{ width:100%; padding:12px 14px; border-radius:5px; border:1px solid var(--line); background:rgba(0,0,0,0.25); color:var(--cream); font-family:'Source Sans Pro',sans-serif; font-size:18px; }
+  #edit-panel select option{ background:#16273a; }
+  #mode-block{ margin-top:22px; }
+  #mode-options{ display:flex; gap:12px; }
+  #edit-panel .mode-opt{ display:flex; align-items:center; gap:10px; margin:0; flex:1; padding:11px 14px; border:1px solid var(--line); border-radius:5px; background:rgba(0,0,0,0.25); font-family:'Source Sans Pro',sans-serif; font-size:18px; letter-spacing:0; text-transform:none; color:var(--cream); cursor:pointer; }
+  #edit-panel .mode-opt input{ width:18px; height:18px; accent-color:var(--amber); }
+  #edit-panel .mode-opt small{ display:block; font-size:12px; color:rgba(253,248,229,0.5); }
+  #geo-status{ margin-top:10px; font-size:14px; color:rgba(253,248,229,0.6); min-height:20px; }
+  .btn-row{ display:flex; gap:14px; margin-top:28px; }
+  .btn{ font-family:'Oswald',sans-serif; font-size:14px; letter-spacing:0.14em; text-transform:uppercase; padding:13px 20px; border-radius:5px; border:1px solid var(--line); background:transparent; color:var(--cream); cursor:pointer; flex:1; }
+  .btn:hover{ background:rgba(253,248,229,0.08); }
+  .btn.primary{ background:var(--amber); border-color:var(--amber); color:#0d1620; }
+  .btn.primary:hover{ background:var(--amber-bright); }
+</style>
+</head>
+<body>
+
+  <div id="header">
+    <div id="title-block">
+      <svg id="compass-mark" viewBox="0 0 48 48">
+        <circle cx="24" cy="24" r="21" fill="none" stroke="#ff7030" stroke-width="1.4" opacity="0.6"/>
+        <circle cx="24" cy="24" r="16" fill="none" stroke="#ff7030" stroke-width="0.8" opacity="0.3"/>
+        <path d="M24,10 L26,22 L38,24 L26,26 L24,38 L22,26 L10,24 L22,22 Z" transform="rotate(45 24 24)" fill="#ff7030" opacity="0.7"/>
+        <path d="M24,2 L27.5,20.5 L46,24 L27.5,27.5 L24,46 L20.5,27.5 L2,24 L20.5,20.5 Z" fill="#ffab73"/>
+        <path d="M24,2 L27.5,20.5 L24,24 L20.5,20.5 Z" fill="#ff7030"/>
+        <circle cx="24" cy="24" r="2.4" fill="#0d1620"/>
+      </svg>
+      <div id="title-text">
+        <h1><span id="state-name">—</span> POTA Spots</h1>
+        <div class="sub">PARKS ON THE AIR, LIVE ACTIVATIONS</div>
+      </div>
+    </div>
+    <div id="status-block">
+      <div id="status"><span class="dot"></span><span id="status-text">Connecting</span></div>
+      <div id="last-updated">Updated —</div>
+    </div>
+  </div>
+
+  <div id="legend">
+    <div class="legend-items">
+      <span class="a"><i></i>On Air</span>
+      <span class="i"><i></i>QRT</span>
+    </div>
+    <button id="edit-loc-btn">Change Location</button>
+  </div>
+
+  <div id="map-wrap">
+    <div id="map-frame">
+      <div id="map"></div>
+      <div id="map-caption">—</div>
+      <div id="attribution">Data: <a href="https://pota.app">pota.app</a> · Map: Esri</div>
+    </div>
+  </div>
+
+  <div id="list-header">
+    <div id="list-title-block">
+      <h2>Activator Spots</h2>
+      <div id="list-subtitle">—</div>
+    </div>
+    <div id="ac-count"><b id="nActive">0</b> On Air / <b id="nInactive">0</b> QRT</div>
+  </div>
+  <div id="cols">
+    <div class="col-callsign">Callsign</div>
+    <div class="col-park">Park</div>
+    <div class="col-ref">Ref</div>
+    <div class="col-freq">Freq</div>
+    <div class="col-mode">Mode</div>
+    <div class="col-status">Status</div>
+  </div>
+  <div id="list-wrap">
+    <div id="rows"></div>
+    <div id="empty"></div>
+    <div id="more"></div>
+  </div>
+
+  <div id="overlay">
+    <div id="edit-panel">
+      <h3>Change Location</h3>
+      <label for="state-select">State</label>
+      <select id="state-select"></select>
+      <div id="geo-status"></div>
+      <div id="mode-block">
+        <label>Operating Modes</label>
+        <div id="mode-options"></div>
+      </div>
+      <div class="btn-row">
+        <button class="btn" id="locate-btn">Use My Location</button>
+        <button class="btn" id="cancel-btn">Cancel</button>
+        <button class="btn primary" id="apply-btn">Apply</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+const SPOTS_URL = 'https://api.pota.app/spot/activator';
+const POLL_MS = 3 * 60 * 1000;
+const INACTIVE_MS = 20 * 60 * 1000; // how long QRT spots stay on map and list
+const MAX_ROWS = 11;
+// Operating mode filter groups (modes not listed here are always shown)
+const MODE_GROUPS = { CW: ['CW'], DATA: ['DATA', 'FT4', 'FT8'], PHONE: ['PHONE', 'SSB'] };
+
+// code: [name, [south, west, north, east]]
+const STATES = {
+  AL:['Alabama',[30.2,-88.5,35.0,-84.9]], AK:['Alaska',[51.2,-170,71.4,-130]], AZ:['Arizona',[31.3,-114.8,37.0,-109.0]],
+  AR:['Arkansas',[33.0,-94.6,36.5,-89.6]], CA:['California',[32.5,-124.4,42.0,-114.1]], CO:['Colorado',[37.0,-109.05,41.0,-102.0]],
+  CT:['Connecticut',[41.0,-73.7,42.05,-71.8]], DE:['Delaware',[38.45,-75.8,39.85,-75.0]], DC:['District of Columbia',[38.79,-77.12,38.995,-76.91]],
+  FL:['Florida',[24.5,-87.6,31.0,-80.0]], GA:['Georgia',[30.35,-85.6,35.0,-80.8]], HI:['Hawaii',[18.9,-160.3,22.3,-154.8]],
+  ID:['Idaho',[42.0,-117.2,49.0,-111.0]], IL:['Illinois',[37.0,-91.5,42.5,-87.5]], IN:['Indiana',[37.8,-88.1,41.8,-84.8]],
+  IA:['Iowa',[40.4,-96.6,43.5,-90.1]], KS:['Kansas',[37.0,-102.05,40.0,-94.6]], KY:['Kentucky',[36.5,-89.6,39.15,-81.95]],
+  LA:['Louisiana',[28.9,-94.05,33.0,-89.0]], ME:['Maine',[43.05,-71.1,47.5,-66.9]], MD:['Maryland',[37.9,-79.5,39.75,-75.05]],
+  MA:['Massachusetts',[41.2,-73.5,42.9,-69.9]], MI:['Michigan',[41.7,-90.4,48.3,-82.1]], MN:['Minnesota',[43.5,-97.2,49.4,-89.5]],
+  MS:['Mississippi',[30.2,-91.65,35.0,-88.1]], MO:['Missouri',[36.0,-95.8,40.6,-89.1]], MT:['Montana',[44.4,-116.05,49.0,-104.05]],
+  NE:['Nebraska',[40.0,-104.05,43.0,-95.3]], NV:['Nevada',[35.0,-120.0,42.0,-114.0]], NH:['New Hampshire',[42.7,-72.6,45.3,-70.6]],
+  NJ:['New Jersey',[38.9,-75.6,41.4,-73.9]], NM:['New Mexico',[31.3,-109.05,37.0,-103.0]], NY:['New York',[40.5,-79.8,45.0,-71.85]],
+  NC:['North Carolina',[33.8,-84.3,36.6,-75.4]], ND:['North Dakota',[45.9,-104.05,49.0,-96.55]], OH:['Ohio',[38.4,-84.8,41.98,-80.5]],
+  OK:['Oklahoma',[33.6,-103.0,37.0,-94.4]], OR:['Oregon',[42.0,-124.6,46.3,-116.45]], PA:['Pennsylvania',[39.7,-80.5,42.3,-74.7]],
+  RI:['Rhode Island',[41.1,-71.9,42.02,-71.1]], SC:['South Carolina',[32.0,-83.35,35.2,-78.5]], SD:['South Dakota',[42.5,-104.05,45.95,-96.4]],
+  TN:['Tennessee',[34.98,-90.3,36.7,-81.65]], TX:['Texas',[25.8,-106.65,36.5,-93.5]], UT:['Utah',[37.0,-114.05,42.0,-109.05]],
+  VT:['Vermont',[42.7,-73.45,45.0,-71.5]], VA:['Virginia',[36.5,-83.7,39.5,-75.2]], WA:['Washington',[45.5,-124.8,49.0,-116.9]],
+  WV:['West Virginia',[37.2,-82.65,40.65,-77.7]], WI:['Wisconsin',[42.5,-92.9,47.1,-86.8]], WY:['Wyoming',[41.0,-111.05,45.0,-104.05]]
+};
+
+const $ = id => document.getElementById(id);
+let stateCode = localStorage.getItem('potaState') || 'MI';
+let modes = JSON.parse(localStorage.getItem('potaModes') ?? JSON.stringify(Object.keys(MODE_GROUPS)));
+const modeVisible = e => {
+  const group = Object.keys(MODE_GROUPS).find(g => MODE_GROUPS[g].includes(e.mode.toUpperCase()));
+  return !group || modes.includes(group);
+};
+
+// ---- Map ----
+const map = L.map('map', {
+  zoomControl: false, attributionControl: false, zoomSnap: 0.1,
+  dragging: false, scrollWheelZoom: false, doubleClickZoom: false,
+  boxZoom: false, keyboard: false, touchZoom: false
+});
+L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}', { maxZoom: 16 }).addTo(map);
+map.createPane('labels').style.zIndex = 250;
+map.getPane('labels').style.pointerEvents = 'none';
+L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}', { maxZoom: 16, pane: 'labels' }).addTo(map);
+map.createPane('lines').style.zIndex = 550;
+map.getPane('lines').style.pointerEvents = 'none';
+const markers = L.layerGroup().addTo(map);
+
+function applyState() {
+  const [name, b] = STATES[stateCode];
+  $('state-name').textContent = name;
+  $('map-caption').textContent = name;
+  $('list-subtitle').textContent = `${name} parks`;
+  $('empty').textContent = `No on-air ${name} spots`;
+  document.title = `${name} POTA Spotter`;
+  map.fitBounds([[b[0], b[1]], [b[2], b[3]]], { padding: [10, 10], animate: false });
+}
+
+// key "CALLSIGN|REF" -> entry
+const entries = new Map();
+
+async function poll() {
+  const code = stateCode;
+  const res = await fetch(SPOTS_URL);
+  if (!res.ok) throw new Error(`POTA API returned ${res.status}`);
+  const spots = await res.json();
+  if (code !== stateCode) return; // state changed while request was in flight
+  const now = Date.now();
+  const current = new Map();
+
+  for (const s of spots) {
+    if (!s.locationDesc.split(',').some(l => l.trim() === 'US-' + code)) continue;
+    const key = `${s.activator}|${s.reference}`;
+    const spotTime = Date.parse(s.spotTime + 'Z');
+    const prev = current.get(key);
+    if (!prev || spotTime > prev.spotTime) {
+      current.set(key, {
+        callsign: s.activator, ref: s.reference, name: s.name,
+        lat: s.latitude, lon: s.longitude, freq: s.frequency, mode: s.mode,
+        spotTime, lastSeen: now, active: true
+      });
+    }
+  }
+  for (const [key, e] of entries) if (!current.has(key)) e.active = false;
+  for (const [key, e] of current) entries.set(key, e);
+  for (const [key, e] of entries) if (!e.active && now - e.lastSeen > INACTIVE_MS) entries.delete(key);
+
+  setStatus('Live', 'live');
+  $('last-updated').textContent = 'Updated ' + new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  render();
+}
+
+// ---- Map layout: collision handling ----
+const CLUSTER_COLORS = ['#4fc3f7', '#ffd84a', '#f06ad8', '#ff9a3c', '#a78bfa', '#5fd48a', '#ff6b81', '#2dd4bf'];
+const TABLE_W = 380, ROW_H = 24, PIN_H = 58;
+const overlap = (a, b) => a.x0 < b.x1 && a.x1 > b.x0 && a.y0 < b.y1 && a.y1 > b.y0;
+const overlapArea = (a, b) => Math.max(0, Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0)) * Math.max(0, Math.min(a.y1, b.y1) - Math.max(a.y0, b.y0));
+const iconRect = pt => ({ x0: pt.x - 16, x1: pt.x + 16, y0: pt.y - 40, y1: pt.y });
+
+function pinRect(p, mapWidth) {
+  const { x, y } = p.pt;
+  const w = Math.max(p.callsign.length * 12, p.name.length * 7.2, p.ref.length * 8) + 4;
+  const left = x > mapWidth * 0.6;
+  const lx = left ? x - 22 - w : x + 22;
+  return { x0: Math.min(x - 16, lx) - 4, x1: Math.max(x + 16, lx + w) + 4, y0: y - 44, y1: Math.max(y, y - 40 + PIN_H) + 4, left };
+}
+
+function pinHtml(p, labelled, left, color) {
+  return `<div class="pin ${p.active ? 'active' : 'inactive'}${left ? ' left' : ''}${color ? ' tinted' : ''}"${color ? ` style="--c:${color}"` : ''}>
+    ${p.active ? '<span class="ring"></span>' : ''}
+    <svg viewBox="-12 -19 24 30"><path d="M0,-18 L9,-6 H4 L11,4 H2 V10 H-2 V4 H-11 L-4,-6 H-9 Z"/></svg>
+    ${labelled ? `<div class="pin-label"><div class="call">${p.callsign}</div><div class="pk">${p.name}</div><div class="pk">${p.ref}</div></div>` : ''}</div>`;
+}
+
+function addPin(p, labelled, left, color) {
+  L.marker([p.lat, p.lon], {
+    icon: L.divIcon({ className: 'pin-wrap', iconSize: [0, 0], html: pinHtml(p, labelled, left, color) }),
+    zIndexOffset: p.active ? 1000 : 0, interactive: false
+  }).addTo(markers);
+}
+
+function drawMap(spots) {
+  const size = map.getSize();
+  markers.clearLayers();
+
+  let pins = spots.map(p => {
+    const pt = map.latLngToContainerPoint([p.lat, p.lon]);
+    return { ...p, pt, r: pinRect({ ...p, pt }, size.x) };
+  });
+
+  // A QRT spot that would interfere with an on-air spot is dropped from the map
+  const actives = pins.filter(p => p.active);
+  pins = pins.filter(p => p.active || !actives.some(a => overlap(a.r, p.r)));
+
+  // Group spots whose pins overlap (union-find)
+  const root = pins.map((_, i) => i);
+  const find = i => (root[i] === i ? i : (root[i] = find(root[i])));
+  for (let i = 0; i < pins.length; i++)
+    for (let j = i + 1; j < pins.length; j++)
+      if (overlap(pins[i].r, pins[j].r)) root[find(i)] = find(j);
+  const groups = new Map();
+  pins.forEach((p, i) => {
+    const g = groups.get(find(i)) ?? [];
+    g.push(p);
+    groups.set(find(i), g);
+  });
+
+  const singles = [], clusters = [];
+  for (const g of groups.values()) (g.length === 1 ? singles : clusters).push(g);
+
+  // Single spots: icon plus label (QRT drawn first so on-air sits on top)
+  singles.map(g => g[0]).sort((a, b) => a.active - b.active).forEach(p => addPin(p, true, p.r.left));
+
+  // Clusters: icons on the map, details in a table joined by lines
+  const placed = singles.map(g => g[0].r);
+  for (const g of clusters) g.forEach(p => placed.push(iconRect(p.pt)));
+  for (const g of clusters.sort((a, b) => b.length - a.length)) {
+    const h = g.length * ROW_H + 12;
+    const cb = {
+      x0: Math.min(...g.map(p => p.pt.x)) - 16, x1: Math.max(...g.map(p => p.pt.x)) + 16,
+      y0: Math.min(...g.map(p => p.pt.y)) - 40, y1: Math.max(...g.map(p => p.pt.y))
+    };
+    const cx = (cb.x0 + cb.x1) / 2, cy = (cb.y0 + cb.y1) / 2, gap = 40;
+    const candidates = [
+      [cb.x1 + gap, cy - h / 2], [cb.x0 - gap - TABLE_W, cy - h / 2],
+      [cx - TABLE_W / 2, cb.y0 - gap - h], [cx - TABLE_W / 2, cb.y1 + gap],
+      [cb.x1 + 30, cb.y0 - 30 - h], [cb.x0 - 30 - TABLE_W, cb.y0 - 30 - h],
+      [cb.x1 + 30, cb.y1 + 30], [cb.x0 - 30 - TABLE_W, cb.y1 + 30]
+    ].map(([x, y]) => {
+      const tx = Math.min(Math.max(x, 8), size.x - TABLE_W - 8), ty = Math.min(Math.max(y, 8), size.y - h - 8);
+      const rect = { x0: tx, x1: tx + TABLE_W, y0: ty, y1: ty + h };
+      const cost = placed.reduce((sum, r) => sum + overlapArea(rect, r), 0) + 0.05 * Math.hypot(tx + TABLE_W / 2 - cx, ty + h / 2 - cy);
+      return { tx, ty, rect, cost };
+    });
+    const best = candidates.reduce((m, c) => (c.cost < m.cost ? c : m));
+    placed.push(best.rect);
+
+    // One icon and one line per park, even when several callsigns share it
+    const parkPins = new Map();
+    for (const p of g) {
+      const seen = parkPins.get(p.ref);
+      if (!seen || (p.active && !seen.active)) parkPins.set(p.ref, p);
+    }
+    // Parks sharing a table each get their own color so trees, lines and rows can be matched
+    const colorOf = new Map();
+    if (parkPins.size > 1) [...parkPins.keys()].sort().forEach((ref, i) => colorOf.set(ref, CLUSTER_COLORS[i % CLUSTER_COLORS.length]));
+    for (const p of parkPins.values()) {
+      const color = colorOf.get(p.ref);
+      addPin(p, false, false, color);
+      const ex = Math.min(Math.max(p.pt.x, best.rect.x0), best.rect.x1);
+      const ey = Math.min(Math.max(p.pt.y - 20, best.rect.y0), best.rect.y1);
+      L.polyline([map.containerPointToLatLng([p.pt.x, p.pt.y - 20]), map.containerPointToLatLng([ex, ey])],
+        { pane: 'lines', color: color ?? '#fdf8e5', weight: 2, opacity: p.active ? 0.85 : 0.4, interactive: false }).addTo(markers);
+    }
+    const rows = g.sort((a, b) => (b.active - a.active) || a.callsign.localeCompare(b.callsign)).map(p => `
+      <div class="crow ${p.active ? 'active' : 'inactive'}${colorOf.has(p.ref) ? ' tinted' : ''}"${colorOf.has(p.ref) ? ` style="--c:${colorOf.get(p.ref)}"` : ''}><span class="cdot"></span><span class="ccall">${p.callsign}</span><span class="cpark">${p.name}</span><span class="cref">${p.ref}</span></div>`).join('');
+    L.marker(map.containerPointToLatLng([best.tx, best.ty]), {
+      icon: L.divIcon({ className: 'pin-wrap', iconSize: [0, 0], html: `<div class="cluster">${rows}</div>` }),
+      zIndexOffset: 2000, interactive: false
+    }).addTo(markers);
+  }
+}
+
+function render() {
+  const list = [...entries.values()].filter(modeVisible).sort((a, b) => (b.active - a.active) || (b.spotTime - a.spotTime));
+
+  drawMap(list);
+
+  const nA = list.filter(e => e.active).length;
+  $('nActive').textContent = nA;
+  $('nInactive').textContent = list.length - nA;
+  $('rows').innerHTML = list.slice(0, MAX_ROWS).map(e => `
+    <div class="row ${e.active ? 'active' : 'inactive'}">
+      <div class="col-callsign">${e.callsign}</div><div class="col-park">${e.name}</div><div class="col-ref">${e.ref}</div>
+      <div class="col-freq">${e.freq}</div><div class="col-mode">${e.mode}</div>
+      <div class="col-status"><span class="sdot"></span>${e.active ? 'On Air' : 'QRT'}</div>
+    </div>`).join('');
+  $('more').textContent = list.length > MAX_ROWS ? `+ ${list.length - MAX_ROWS} more` : '';
+  $('empty').style.display = list.length ? 'none' : 'block';
+}
+
+function setStatus(text, kind) {
+  $('status-text').textContent = text;
+  $('status').classList.toggle('unreachable', kind === 'unreachable');
+}
+
+function run() {
+  poll().catch(err => setStatus('Error: ' + err.message, 'unreachable'));
+}
+
+// ---- Change Location ----
+const select = $('state-select');
+select.innerHTML = Object.entries(STATES)
+  .sort((a, b) => a[1][0].localeCompare(b[1][0]))
+  .map(([code, [name]]) => `<option value="${code}">${name}</option>`).join('');
+
+$('mode-options').innerHTML = Object.entries(MODE_GROUPS).map(([group, members]) => `
+  <label class="mode-opt"><input type="checkbox" value="${group}"><span>${group}${members.length > 1 ? `<small>${members.join(', ')}</small>` : ''}</span></label>`).join('');
+
+$('edit-loc-btn').onclick = () => {
+  select.value = stateCode;
+  document.querySelectorAll('#mode-options input').forEach(box => { box.checked = modes.includes(box.value); });
+  $('geo-status').textContent = '';
+  $('overlay').classList.add('show');
+};
+$('cancel-btn').onclick = () => $('overlay').classList.remove('show');
+$('apply-btn').onclick = () => {
+  $('overlay').classList.remove('show');
+  modes = [...document.querySelectorAll('#mode-options input:checked')].map(box => box.value);
+  localStorage.setItem('potaModes', JSON.stringify(modes));
+  const stateChanged = select.value !== stateCode;
+  if (stateChanged) {
+    stateCode = select.value;
+    localStorage.setItem('potaState', stateCode);
+    entries.clear();
+    applyState();
+  }
+  render();
+  if (stateChanged) run();
+};
+
+$('locate-btn').onclick = async () => {
+  const geo = $('geo-status');
+  geo.textContent = 'Locating…';
+  try {
+    if (!navigator.geolocation) throw new Error('Location is not available in this browser');
+    const pos = await new Promise((resolve, reject) => navigator.geolocation.getCurrentPosition(resolve, reject));
+    const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=5&lat=${pos.coords.latitude}&lon=${pos.coords.longitude}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`Reverse geocoding returned ${res.status}`);
+    const code = ((await res.json()).address['ISO3166-2-lvl4'] || '').replace('US-', '');
+    if (!STATES[code]) throw new Error('Your location is not in a US state');
+    select.value = code;
+    geo.textContent = `Located: ${STATES[code][0]}. Press Apply to switch.`;
+  } catch (err) {
+    geo.textContent = err.message;
+  }
+};
+
+applyState();
+run();
+setInterval(run, POLL_MS);
+</script>
+</body>
+</html>
